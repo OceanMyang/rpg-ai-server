@@ -248,3 +248,8 @@ textarea:disabled {
   border: 0;
   border-top: 1px solid #2c2f2e;
 }
+
+textarea.masked {
+  -webkit-text-security: disc;
+  text-security: disc;
+}

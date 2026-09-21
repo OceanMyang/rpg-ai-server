@@ -147,7 +147,7 @@ function lockAccess() {
   accessToken = '';
   localStorage.removeItem(TOKEN_KEY);
   input.value = '';
-  input.type = 'password';
+  input.classList.add('masked');
   input.placeholder = 'Access password';
   statusElement.textContent = 'Password required';
 }
@@ -156,7 +156,7 @@ function unlockAccess(token) {
   locked = false;
   accessToken = token;
   localStorage.setItem(TOKEN_KEY, token);
-  input.type = 'text';
+  input.classList.remove('masked');
   input.placeholder = 'What do you do?';
 }
 

@@ -10,7 +10,7 @@ import { runHostTurn } from './src/host.mjs';
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 await loadEnv(path.join(ROOT, '.env'));
 
-const HOST = process.env.HOST || '127.0.0.1';
+const HOST = process.env.HOST || '0.0.0.0';
 const PORT = Number.parseInt(process.env.PORT || '3000', 10);
 const MODEL = process.env.RPG_MODEL || 'inclusionai/ling-3.0-flash-vl:free';
 const API_KEY = process.env.OPENROUTER_API_KEY || process.env.API_KEY || '';

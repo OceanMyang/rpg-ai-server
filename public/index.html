@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#000000">
+    <title>RPG AI</title>
+    <link rel="stylesheet" href="./style.css">
+  </head>
+  <body>
+    <main class="game" aria-label="RPG AI chat">
+      <header>
+        <div>
+          <h1>RPG AI</h1>
+          <p id="status">Connecting…</p>
+        </div>
+        <button id="new-game" type="button">New game</button>
+      </header>
+
+      <section id="messages" class="messages" aria-live="polite" aria-label="Story"></section>
+
+      <form id="composer">
+        <label class="sr-only" for="action">What do you do?</label>
+        <textarea
+          id="action"
+          name="action"
+          rows="1"
+          maxlength="2000"
+          placeholder="What do you do?"
+          autocomplete="off"
+          enterkeyhint="send"
+          required
+        ></textarea>
+        <button id="send" type="submit" aria-label="Send action">Send</button>
+      </form>
+    </main>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

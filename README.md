@@ -49,12 +49,20 @@ world/
   player/          selectable player characters (optional; without it one is picked at random from characters/)
   characters/      one file per character
   <Entity>.md      one file per other entity: places, items, spirits…
-saves/<game-id>/
-  session.json     chat history
-  files/           this game's private copy of game/ and world/
+saves/
+  players/<player-id>.json   which game that browser is playing
+  <game-id>/
+    session.json             chat history, including the owning player id
+    files/                   this game's private copy of game/ and world/
 ```
 
 `game/` and `world/` in the project root are the pristine templates. Play never modifies them.
+
+## Players
+
+Each browser gets an opaque `rpg_player` cookie on its first API request: HttpOnly, SameSite=Lax, and marked Secure behind an HTTPS proxy. Every save records the player that owns it, and a game belonging to another player reads as "not found". A visitor with no cookie always starts a fresh story, so nobody lands in someone else's game.
+
+This identifies a browser, not a person: clearing cookies starts over, and a shared browser profile shares the games. `ACCESS_PASSWORD`, if set, is a single shared gate in front of everything and does not distinguish players.
 
 ## How a turn works
 

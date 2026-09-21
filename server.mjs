@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadEnv } from './src/env.mjs';
-import { createGameStore } from './src/game-store.mjs';
+import { createGameStore, isPlayerId, newPlayerId } from './src/game-store.mjs';
 import { runHostTurn } from './src/host.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -19,6 +19,8 @@ const ACCESS_TOKEN = ACCESS_PASSWORD
   ? createHash('sha256').update(`rpg-ai:${ACCESS_PASSWORD}`).digest('hex')
   : '';
 const MAX_BODY_BYTES = 16 * 1024;
+const PLAYER_COOKIE = 'rpg_player';
+const PLAYER_COOKIE_MAX_AGE = 60 * 60 * 24 * 365;
 const TURN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
 if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65_535) {
@@ -61,6 +63,25 @@ class HttpError extends Error {
   }
 }
 
+function readPlayerCookie(request) {
+  const header = request.headers.cookie;
+  if (typeof header !== 'string') return null;
+  for (const part of header.split(';')) {
+    const [name, ...rest] = part.trim().split('=');
+    if (name === PLAYER_COOKIE) {
+      const value = rest.join('=');
+      return isPlayerId(value) ? value : null;
+    }
+  }
+  return null;
+}
+
+// One opaque id per browser. HttpOnly keeps page scripts from reading it.
+function playerCookie(request, playerId) {
+  const secure = request.headers['x-forwarded-proto'] === 'https' ? '; Secure' : '';
+  return `${PLAYER_COOKIE}=${playerId}; Path=/; Max-Age=${PLAYER_COOKIE_MAX_AGE}; HttpOnly; SameSite=Lax${secure}`;
+}
+
 function headers(contentType) {
   return {
     'Content-Type': contentType,
@@ -71,8 +92,8 @@ function headers(contentType) {
   };
 }
 
-function sendJson(response, status, value) {
-  response.writeHead(status, headers('application/json; charset=utf-8'));
+function sendJson(response, status, value, extraHeaders = {}) {
+  response.writeHead(status, { ...headers('application/json; charset=utf-8'), ...extraHeaders });
   response.end(JSON.stringify(value));
 }
 
@@ -99,9 +120,9 @@ function publicSession(session) {
   };
 }
 
-async function playTurn(gameId, action, turnId) {
+async function playTurn(gameId, playerId, action, turnId) {
   return store.withGameLock(gameId, async () => {
-    const session = await store.loadGame(gameId);
+    const session = await store.loadGame(gameId, playerId);
     const actionHash = createHash('sha256').update(action, 'utf8').digest('hex');
     const completed = session.completedTurns?.[turnId];
     if (completed) {
@@ -140,13 +161,13 @@ async function playTurn(gameId, action, turnId) {
   });
 }
 
-async function handleApi(request, response, url) {
+async function handleApi(request, response, url, playerId, setCookie) {
   if (request.method === 'GET' && url.pathname === '/api/status') {
     sendJson(response, 200, {
       configured: Boolean(API_KEY),
       model: MODEL,
       requiresPassword: Boolean(ACCESS_TOKEN)
-    });
+    }, setCookie);
     return;
   }
   if (ACCESS_TOKEN) {
@@ -159,7 +180,7 @@ async function handleApi(request, response, url) {
         await new Promise((resolve) => setTimeout(resolve, 1_000));
         throw new HttpError(401, 'Wrong password.');
       }
-      sendJson(response, 200, { token: ACCESS_TOKEN });
+      sendJson(response, 200, { token: ACCESS_TOKEN }, setCookie);
       return;
     }
     if (!tokenMatches(request.headers['x-access-token'])) {
@@ -167,24 +188,24 @@ async function handleApi(request, response, url) {
     }
   }
   if (request.method === 'POST' && url.pathname === '/api/games') {
-    const session = await store.createGame();
-    sendJson(response, 201, publicSession(session));
+    const session = await store.createGame(playerId);
+    sendJson(response, 201, publicSession(session), setCookie);
     return;
   }
   if (request.method === 'GET' && url.pathname === '/api/games/current') {
-    const session = await store.loadCurrentGame();
-    sendJson(response, 200, publicSession(session));
+    const session = await store.loadCurrentGame(playerId);
+    sendJson(response, 200, publicSession(session), setCookie);
     return;
   }
 
   const gameMatch = /^\/api\/games\/([0-9a-f-]+)$/u.exec(url.pathname);
   if (request.method === 'GET' && gameMatch) {
     const session = await store.withGameLock(gameMatch[1], async () => {
-      const loaded = await store.loadGame(gameMatch[1]);
-      await store.setActiveGame(loaded.id);
+      const loaded = await store.loadGame(gameMatch[1], playerId);
+      await store.setActiveGame(playerId, loaded.id);
       return loaded;
     });
-    sendJson(response, 200, publicSession(session));
+    sendJson(response, 200, publicSession(session), setCookie);
     return;
   }
 
@@ -199,8 +220,8 @@ async function handleApi(request, response, url) {
     if (typeof body.turnId !== 'string' || !TURN_ID_PATTERN.test(body.turnId)) {
       throw new HttpError(400, 'Turn id is invalid.');
     }
-    const result = await playTurn(messageMatch[1], action, body.turnId);
-    sendJson(response, 200, result);
+    const result = await playTurn(messageMatch[1], playerId, action, body.turnId);
+    sendJson(response, 200, result, setCookie);
     return;
   }
 
@@ -211,7 +232,12 @@ const server = createServer(async (request, response) => {
   try {
     const url = new URL(request.url, `http://${request.headers.host || 'localhost'}`);
     if (url.pathname.startsWith('/api/')) {
-      await handleApi(request, response, url);
+      const existing = readPlayerCookie(request);
+      const playerId = existing ?? newPlayerId();
+      const setCookie = existing
+        ? {}
+        : { 'Set-Cookie': playerCookie(request, playerId) };
+      await handleApi(request, response, url, playerId, setCookie);
       return;
     }
     const staticEntry = staticFiles.get(url.pathname);

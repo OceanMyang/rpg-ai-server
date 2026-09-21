@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import {
   mkdir,
   readdir,
@@ -11,10 +11,27 @@ import path from 'node:path';
 import { copyWorld, listWorldFiles, readWorldFile } from './world-files.mjs';
 
 const GAME_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
-const SAVE_FORMAT = 2;
+const SAVE_FORMAT = 3;
+const PLAYER_ID_PATTERN = /^[0-9a-f]{32}$/u;
 const TEMPLATE_FOLDERS = ['game', 'world'];
 const PLAYER_FOLDER = 'world/player/';
 const locks = new Map();
+
+export function newPlayerId() {
+  return randomBytes(16).toString('hex');
+}
+
+export function isPlayerId(value) {
+  return typeof value === 'string' && PLAYER_ID_PATTERN.test(value);
+}
+
+function assertPlayerId(playerId) {
+  if (!isPlayerId(playerId)) {
+    const error = new Error('Game not found.');
+    error.code = 'NOT_FOUND';
+    throw error;
+  }
+}
 
 function assertGameId(gameId) {
   if (typeof gameId !== 'string' || !GAME_ID_PATTERN.test(gameId)) {
@@ -55,7 +72,12 @@ export async function openingMessage(filesDir) {
 }
 
 export function createGameStore({ saveRoot, templateRoot }) {
-  const activeFile = path.join(saveRoot, 'active-game.json');
+  // Each player keeps their own pointer, so no visitor can land in another's story.
+  const playerDir = path.join(saveRoot, 'players');
+  const activeFileFor = (playerId) => {
+    assertPlayerId(playerId);
+    return path.join(playerDir, `${playerId}.json`);
+  };
 
   const pathsFor = (gameId) => {
     assertGameId(gameId);
@@ -129,16 +151,18 @@ export function createGameStore({ saveRoot, templateRoot }) {
     await rm(commitFile, { force: true });
   }
 
-  async function setActiveGame(gameId) {
+  async function setActiveGame(playerId, gameId) {
     assertGameId(gameId);
-    await mkdir(saveRoot, { recursive: true, mode: 0o700 });
-    await atomicJsonWrite(activeFile, {
+    const pointerFile = activeFileFor(playerId);
+    await mkdir(playerDir, { recursive: true, mode: 0o700 });
+    await atomicJsonWrite(pointerFile, {
       gameId,
       updatedAt: new Date().toISOString()
     });
   }
 
-  async function createGame() {
+  async function createGame(playerId) {
+    assertPlayerId(playerId);
     await mkdir(saveRoot, { recursive: true, mode: 0o700 });
     const id = randomUUID();
     const { gameDir, filesDir, sessionFile } = pathsFor(id);
@@ -151,6 +175,7 @@ export function createGameStore({ saveRoot, templateRoot }) {
     const now = new Date().toISOString();
     const session = {
       id,
+      playerId,
       format: SAVE_FORMAT,
       status: 'playing',
       createdAt: now,
@@ -159,11 +184,12 @@ export function createGameStore({ saveRoot, templateRoot }) {
       completedTurns: {}
     };
     await atomicJsonWrite(sessionFile, session);
-    await setActiveGame(id);
+    await setActiveGame(playerId, id);
     return session;
   }
 
-  async function loadGame(gameId) {
+  async function loadGame(gameId, playerId) {
+    assertPlayerId(playerId);
     await recoverGame(gameId);
     const { sessionFile } = pathsFor(gameId);
     try {
@@ -172,7 +198,8 @@ export function createGameStore({ saveRoot, templateRoot }) {
       if (session.id !== gameId || !Array.isArray(session.messages)) {
         throw new Error('Invalid save data.');
       }
-      if (session.format !== SAVE_FORMAT) {
+      // An unowned or other player's save is simply not found for this player.
+      if (session.format !== SAVE_FORMAT || session.playerId !== playerId) {
         const outdated = new Error('Game not found.');
         outdated.code = 'NOT_FOUND';
         throw outdated;
@@ -188,11 +215,12 @@ export function createGameStore({ saveRoot, templateRoot }) {
     }
   }
 
-  async function loadCurrentGame() {
+  async function loadCurrentGame(playerId) {
+    assertPlayerId(playerId);
     try {
-      const pointer = JSON.parse(await readFile(activeFile, 'utf8'));
+      const pointer = JSON.parse(await readFile(activeFileFor(playerId), 'utf8'));
       assertGameId(pointer.gameId);
-      return await withGameLock(pointer.gameId, () => loadGame(pointer.gameId));
+      return await withGameLock(pointer.gameId, () => loadGame(pointer.gameId, playerId));
     } catch (error) {
       if (
         error.code !== 'ENOENT'
@@ -219,7 +247,7 @@ export function createGameStore({ saveRoot, templateRoot }) {
     for (const entry of entries) {
       if (!entry.isDirectory() || !GAME_ID_PATTERN.test(entry.name)) continue;
       try {
-        const session = await withGameLock(entry.name, () => loadGame(entry.name));
+        const session = await withGameLock(entry.name, () => loadGame(entry.name, playerId));
         const timestamp = Date.parse(session.updatedAt || session.createdAt || '') || 0;
         candidates.push({ session, timestamp });
       } catch { /* Ignore incomplete or invalid save directories. */ }
@@ -232,8 +260,8 @@ export function createGameStore({ saveRoot, templateRoot }) {
       throw notFound;
     }
     return withGameLock(latest.id, async () => {
-      const current = await loadGame(latest.id);
-      await setActiveGame(current.id);
+      const current = await loadGame(latest.id, playerId);
+      await setActiveGame(playerId, current.id);
       return current;
     });
   }
@@ -290,7 +318,7 @@ export function createGameStore({ saveRoot, templateRoot }) {
       await recoverGame(gameId).catch(() => {});
       throw error;
     }
-    await setActiveGame(gameId).catch(() => {});
+    await setActiveGame(session.playerId, gameId).catch(() => {});
   }
 
   return {

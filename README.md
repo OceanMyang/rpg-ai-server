@@ -13,14 +13,12 @@ Requires Node.js 20 or newer and an OpenRouter API key.
    ```text
    API_KEY=your_openrouter_key
    ```
-
 2. Start the server:
 
    ```sh
    npm start
    ```
-
-3. Open <http://127.0.0.1:3000>.
+3. Open [http://127.0.0.1:3000](http://127.0.0.1:3000).
 
 For a phone on the same Wi-Fi network:
 
@@ -67,6 +65,7 @@ This identifies a browser, not a person: clearing cookies starts over, and a sha
 ## How a turn works
 
 The server sends the model:
+
 - the system prompt and host rules,
 - the recent chat,
 - a manifest of the save's files,
@@ -82,10 +81,11 @@ Transient model failures are retried within a three-minute turn budget. An inter
 - `RPG_MODEL`: model slug; defaults to `inclusionai/ling-3.0-flash-vl:free`
 - `HOST`: bind address; defaults to `127.0.0.1`
 - `PORT`: port; defaults to `3000`
+- `ACCESS_PASSWORD`: shared password for the site; required when binding to anything but localhost
+- `SAVE_DIR`: where games are stored; defaults to `saves/` in the project. Point it at a mounted volume (e.g. `/data/saves`) on hosts with ephemeral disks, or every deploy wipes the saves.
 
 ## Test
 
 ```sh
 npm test
 ```
-# rpg-ai-server

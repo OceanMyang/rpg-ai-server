@@ -40,7 +40,7 @@ const basePrompt = [
   await readFile(path.join(ROOT, 'host_rules.md'), 'utf8')
 ].map((part) => part.trim()).join('\n\n---\n\n');
 const store = createGameStore({
-  saveRoot: path.join(ROOT, 'saves'),
+  saveRoot: process.env.SAVE_DIR || path.join(ROOT, 'saves'),
   templateRoot: ROOT
 });
 

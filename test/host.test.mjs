@@ -374,3 +374,183 @@ test('dice results are stable when the same turn is retried', async () => {
 
   assert.deepEqual(await playOnce(), await playOnce());
 });
+
+function sseResponse(chunks) {
+  const body = chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join('') + 'data: [DONE]\n\n';
+  return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+}
+
+const textChunk = (text) => ({ choices: [{ delta: { content: text } }] });
+
+test('streamed narration arrives as ordered deltas and becomes the turn result', async () => {
+  const world = await mkdtemp(path.join(os.tmpdir(), 'rpg-ai-stream-'));
+  await mkdir(path.join(world, 'game'));
+  await writeFile(path.join(world, 'game', 'state.md'), '# Game State\n');
+  const events = [];
+  let requestBody;
+
+  const result = await runHostTurn({
+    apiKey: 'test-key',
+    model: 'test-model',
+    basePrompt: 'You are the host.',
+    worldDir: world,
+    publicHistory: [{ role: 'user', content: 'I wait.' }],
+    onEvent: (event) => events.push(event),
+    fetchImpl: async (_url, options) => {
+      requestBody = JSON.parse(options.body);
+      return sseResponse([
+        textChunk('The fog '),
+        textChunk('parts at [[Test Quay]].'),
+        { choices: [{ delta: {}, finish_reason: 'stop' }] }
+      ]);
+    }
+  });
+
+  assert.equal(requestBody.stream, true);
+  assert.ok(!requestBody.tools.some((tool) => tool.function.name === 'finish_turn'));
+  assert.deepEqual(events, [
+    { type: 'delta', text: 'The fog ' },
+    { type: 'delta', text: 'parts at [[Test Quay]].' }
+  ]);
+  assert.equal(result, 'The fog parts at Test Quay.');
+});
+
+test('preamble before a tool call is withdrawn and split tool arguments are assembled', async () => {
+  const world = await mkdtemp(path.join(os.tmpdir(), 'rpg-ai-stream-tools-'));
+  await mkdir(path.join(world, 'game'));
+  await writeFile(path.join(world, 'game', 'state.md'), '# Game State\n');
+  const events = [];
+  const requests = [];
+
+  const result = await runHostTurn({
+    apiKey: 'test-key',
+    model: 'test-model',
+    basePrompt: 'You are the host.',
+    worldDir: world,
+    publicHistory: [{ role: 'user', content: 'I climb the wall.' }],
+    turnId: 'b3a1c2d4-1111-4222-8333-444455556666',
+    onEvent: (event) => events.push(event),
+    fetchImpl: async (_url, options) => {
+      requests.push(JSON.parse(options.body));
+      if (requests.length === 1) {
+        return sseResponse([
+          textChunk('Let me roll for that.'),
+          { choices: [{ delta: { tool_calls: [{ index: 0, id: 'roll-1', function: { name: 'roll_dice', arguments: '{"count":2,"sides":6,' } }] } }] },
+          { choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '"modifier":1,"reason":"Climb the wall"}' } }] } }] },
+          { choices: [{ delta: {}, finish_reason: 'tool_calls' }] }
+        ]);
+      }
+      return sseResponse([textChunk('You haul yourself over the top.')]);
+    }
+  });
+
+  assert.equal(result, 'You haul yourself over the top.');
+  assert.deepEqual(events, [
+    { type: 'delta', text: 'Let me roll for that.' },
+    { type: 'reset' },
+    { type: 'delta', text: 'You haul yourself over the top.' }
+  ]);
+  const toolMessage = requests[1].messages.find((message) => message.role === 'tool');
+  const roll = JSON.parse(toolMessage.content);
+  assert.equal(roll.ok, true);
+  assert.equal(roll.notation, '2d6+1');
+});
+
+test('text streamed by a failed request is withdrawn before the retry', async () => {
+  const world = await mkdtemp(path.join(os.tmpdir(), 'rpg-ai-stream-retry-'));
+  await mkdir(path.join(world, 'game'));
+  await writeFile(path.join(world, 'game', 'state.md'), '# Game State\n');
+  const events = [];
+  let calls = 0;
+
+  const result = await runHostTurn({
+    apiKey: 'test-key',
+    model: 'test-model',
+    basePrompt: 'You are the host.',
+    worldDir: world,
+    publicHistory: [{ role: 'user', content: 'I wait.' }],
+    onEvent: (event) => events.push(event),
+    sleep: async () => {},
+    fetchImpl: async () => {
+      calls += 1;
+      if (calls === 1) {
+        return sseResponse([textChunk('The rain be'), { error: { message: 'upstream reset' } }]);
+      }
+      return sseResponse([textChunk('The rain begins.')]);
+    }
+  });
+
+  assert.equal(result, 'The rain begins.');
+  assert.deepEqual(events, [
+    { type: 'delta', text: 'The rain be' },
+    { type: 'reset' },
+    { type: 'delta', text: 'The rain begins.' }
+  ]);
+});
+
+test('whitespace before a tool call never reaches the player', async () => {
+  const world = await mkdtemp(path.join(os.tmpdir(), 'rpg-ai-stream-ws-'));
+  await mkdir(path.join(world, 'game'));
+  await writeFile(path.join(world, 'game', 'state.md'), '# Game State\n');
+  const events = [];
+  let calls = 0;
+
+  await runHostTurn({
+    apiKey: 'test-key',
+    model: 'test-model',
+    basePrompt: 'You are the host.',
+    worldDir: world,
+    publicHistory: [{ role: 'user', content: 'I look around.' }],
+    onEvent: (event) => events.push(event),
+    fetchImpl: async () => {
+      calls += 1;
+      if (calls === 1) {
+        return sseResponse([
+          textChunk('\n'),
+          { choices: [{ delta: { tool_calls: [{ index: 0, id: 'read-1', function: { name: 'read_file', arguments: '{"path":"game/state.md"}' } }] } }] }
+        ]);
+      }
+      return sseResponse([textChunk('\n\n'), textChunk('Dust drifts '), textChunk('over the road.')]);
+    }
+  });
+
+  assert.deepEqual(events, [
+    { type: 'delta', text: 'Dust drifts ' },
+    { type: 'delta', text: 'over the road.' }
+  ]);
+});
+
+test('streamed reasoning fragments are merged into whole blocks for the history', async () => {
+  const world = await mkdtemp(path.join(os.tmpdir(), 'rpg-ai-stream-reasoning-'));
+  await mkdir(path.join(world, 'game'));
+  await writeFile(path.join(world, 'game', 'state.md'), '# Game State\n');
+  const requests = [];
+  const fragment = (text) => ({
+    choices: [{ delta: { reasoning_details: [{ type: 'reasoning.text', text, format: 'unknown', index: 0 }] } }]
+  });
+
+  await runHostTurn({
+    apiKey: 'test-key',
+    model: 'test-model',
+    basePrompt: 'You are the host.',
+    worldDir: world,
+    publicHistory: [{ role: 'user', content: 'I roll.' }],
+    onEvent: () => {},
+    fetchImpl: async (_url, options) => {
+      requests.push(JSON.parse(options.body));
+      if (requests.length === 1) {
+        return sseResponse([
+          fragment('The player '),
+          fragment('wants a roll.'),
+          { choices: [{ delta: { tool_calls: [{ index: 0, id: 'r1', function: { name: 'roll_dice', arguments: '{"count":1,"sides":20,"modifier":0,"reason":"A roll"}' } }] } }] }
+        ]);
+      }
+      return sseResponse([textChunk('You roll.')]);
+    }
+  });
+
+  const assistant = requests[1].messages.find((message) => Array.isArray(message.tool_calls));
+  assert.deepEqual(assistant.reasoning_details, [
+    { type: 'reasoning.text', text: 'The player wants a roll.', format: 'unknown', index: 0 }
+  ]);
+});

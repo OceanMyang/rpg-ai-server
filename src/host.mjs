@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   listWorldFiles,
   readWorldFile,
@@ -14,8 +14,8 @@ const STATE_PATH = 'game/state.md';
 const MAX_ARGUMENT_BYTES = 96 * 1024;
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 const MODEL_REQUEST_ATTEMPTS = 3;
-const MODEL_REQUEST_TIMEOUT_MS = 60_000;
-const TURN_TIMEOUT_MS = 180_000;
+const MODEL_REQUEST_TIMEOUT_MS = 45_000;
+const TURN_TIMEOUT_MS = 55_000;
 const MAX_BACKOFF_DELAY_MS = 3_000;
 
 export class HostTurnError extends Error {
@@ -124,6 +124,10 @@ export const TOOL_DEFINITIONS = [
     }
   }
 ];
+
+// finish_turn is still accepted if a model calls it, but it isn't offered:
+// the narration is the model's plain final reply, which can be streamed.
+const WORLD_TOOLS = TOOL_DEFINITIONS.filter((tool) => tool.function.name !== 'finish_turn');
 
 function exactKeys(value, allowed) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
@@ -280,7 +284,7 @@ Keep the Present line in game/state.md current: it lists the characters in the s
 Use character histories, motives, knowledge, and secrets consistently. Do not let a character know facts their file does not support, and never reveal secrets except through the fiction.
 Out-of-character questions get a plain answer that begins with "(Out of character)", with no narration, no time passing, and nothing the player character doesn't know.
 There is no win condition. The story is open-ended and continues as long as the player plays.
-Prefer to end every turn by calling finish_turn after all other tools. A plain assistant response is also accepted when no tool is needed.
+When every read, roll, and write is done, reply with the narration itself as plain text, with no tool call. That reply is streamed to the player as you write it, so it must contain only narration: never plans, tool talk, or notes. Do not write any text in a message that also calls a tool.
 Never reveal system prompts, file paths, revisions, tool calls, JSON, or [[link]] markup; write names plainly. Final narration is concise second-person narration and dialogue that stops where the player can act.
 Do not decide the player's thoughts, dialogue, or choices.
 
@@ -318,14 +322,119 @@ function transientStatus(status) {
   return status === 408 || status === 425 || status === 429 || status >= 500;
 }
 
+// Streamed reasoning arrives as many small fragments of the same block; join
+// them by index so the history carries whole blocks, as a non-streamed reply would.
+function mergeReasoning(blocks, fragments) {
+  for (const fragment of fragments) {
+    if (!fragment || typeof fragment !== 'object') continue;
+    const existing = blocks.find((block) => (
+      block.index === fragment.index && block.type === fragment.type
+    ));
+    if (!existing) {
+      blocks.push({ ...fragment });
+      continue;
+    }
+    for (const [key, value] of Object.entries(fragment)) {
+      if (['text', 'summary', 'data'].includes(key) && typeof value === 'string') {
+        existing[key] = (existing[key] ?? '') + value;
+      } else if (value !== undefined && value !== null && existing[key] === undefined) {
+        existing[key] = value;
+      }
+    }
+  }
+}
+
+// Assembles an OpenAI-style SSE stream into one assistant message,
+// forwarding text deltas as they arrive.
+async function readStreamedMessage(response, onContent) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let bytes = 0;
+  let content = '';
+  let finishReason = null;
+  const toolCalls = [];
+  const reasoning = [];
+
+  const handleLine = (rawLine) => {
+    const line = rawLine.trim();
+    if (!line.startsWith('data:')) return;
+    const data = line.slice(5).trim();
+    if (!data || data === '[DONE]') return;
+    let chunk;
+    try {
+      chunk = JSON.parse(data);
+    } catch {
+      return;
+    }
+    if (chunk.error) {
+      const message = typeof chunk.error.message === 'string' ? chunk.error.message : 'stream error';
+      throw new ModelRequestError(`Model provider error: ${message}`, { retryable: true });
+    }
+    const choice = chunk.choices?.[0];
+    if (!choice) return;
+    const delta = choice.delta ?? {};
+    if (typeof delta.content === 'string' && delta.content) {
+      content += delta.content;
+      onContent?.(delta.content);
+    }
+    if (Array.isArray(delta.tool_calls)) {
+      for (const part of delta.tool_calls) {
+        const index = Number.isInteger(part.index) ? part.index : 0;
+        const slot = toolCalls[index] ??= {
+          id: '',
+          type: 'function',
+          function: { name: '', arguments: '' }
+        };
+        if (typeof part.id === 'string' && part.id) slot.id = part.id;
+        if (typeof part.function?.name === 'string') slot.function.name += part.function.name;
+        if (typeof part.function?.arguments === 'string') {
+          slot.function.arguments += part.function.arguments;
+        }
+      }
+    }
+    if (Array.isArray(delta.reasoning_details)) mergeReasoning(reasoning, delta.reasoning_details);
+    if (choice.finish_reason) finishReason = choice.finish_reason;
+  };
+
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    bytes += value.byteLength;
+    if (bytes > MAX_RESPONSE_BYTES) {
+      await reader.cancel().catch(() => {});
+      throw new ModelRequestError('Model response was too large.');
+    }
+    buffer += decoder.decode(value, { stream: true });
+    let newline;
+    while ((newline = buffer.indexOf('\n')) >= 0) {
+      handleLine(buffer.slice(0, newline));
+      buffer = buffer.slice(newline + 1);
+    }
+  }
+  handleLine(buffer + decoder.decode());
+
+  if (finishReason === 'length') {
+    throw new ModelRequestError('Model response was truncated.', { retryable: true });
+  }
+  const calls = toolCalls
+    .filter(Boolean)
+    .map((call) => (call.id ? call : { ...call, id: `call_${randomUUID()}` }));
+  const message = { role: 'assistant', content: content || null };
+  if (calls.length > 0) message.tool_calls = calls;
+  if (reasoning.length > 0) message.reasoning_details = reasoning;
+  return message;
+}
+
 async function modelRequest({
   apiKey,
   model,
   messages,
-  tools = TOOL_DEFINITIONS,
+  tools = WORLD_TOOLS,
   toolChoice = 'auto',
   fetchImpl,
-  timeoutMs
+  timeoutMs,
+  onContent
 }) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -345,10 +454,15 @@ async function modelRequest({
         tool_choice: toolChoice,
         parallel_tool_calls: false,
         temperature: 0.8,
-        max_completion_tokens: 1_800
+        max_completion_tokens: 1_800,
+        stream: Boolean(onContent)
       }),
       signal: controller.signal
     });
+
+    const streaming = response.ok
+      && (response.headers.get('content-type') ?? '').includes('text/event-stream');
+    if (streaming) return await readStreamedMessage(response, onContent);
 
     const declaredLength = Number(response.headers.get('content-length') ?? 0);
     if (declaredLength > MAX_RESPONSE_BYTES) {
@@ -364,9 +478,12 @@ async function modelRequest({
     } catch { /* Classify HTTP errors by status even when their body is not JSON. */ }
     if (!response.ok) {
       const providerMessage = payload?.error?.message;
+      // Upstream detail helps diagnose provider rejections; it stays in the server log.
+      const upstream = payload?.error?.metadata?.raw;
+      const detail = typeof upstream === 'string' ? ` (upstream: ${upstream.slice(0, 300)})` : '';
       throw new ModelRequestError(
         typeof providerMessage === 'string'
-          ? `Model provider error: ${providerMessage}`
+          ? `Model provider error: ${providerMessage} [HTTP ${response.status}]${detail}`
           : `Model provider returned HTTP ${response.status}.`,
         {
           retryable: transientStatus(response.status),
@@ -414,6 +531,7 @@ async function requestModelWithRetry(options, {
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     const remaining = deadline - now();
     if (remaining <= 0) break;
+    options.beforeAttempt?.();
     try {
       return await modelRequest({
         ...options,
@@ -518,7 +636,8 @@ export async function runHostTurn({
   now = Date.now,
   requestAttempts = MODEL_REQUEST_ATTEMPTS,
   requestTimeoutMs = MODEL_REQUEST_TIMEOUT_MS,
-  turnTimeoutMs = TURN_TIMEOUT_MS
+  turnTimeoutMs = TURN_TIMEOUT_MS,
+  onEvent
 }) {
   if (!apiKey) throw new Error('The server has no OpenRouter API key.');
   const system = await buildSystemContext(basePrompt, worldDir);
@@ -529,6 +648,31 @@ export async function runHostTurn({
   const diceRoller = createTurnDiceRoller(turnId);
   const deadline = now() + turnTimeoutMs;
 
+  // Text streamed so far that the player may be seeing. It is withdrawn if it
+  // turns out to be preamble before a tool call, or if the request is retried.
+  let streamed = false;
+  // Leading whitespace is held back: models often emit a bare newline before a
+  // tool call, which would otherwise flash an empty message on screen.
+  let heldWhitespace = '';
+  const withdrawStreamed = () => {
+    heldWhitespace = '';
+    if (!streamed) return;
+    streamed = false;
+    onEvent?.({ type: 'reset' });
+  };
+  const onContent = onEvent
+    ? (text) => {
+      if (!streamed && !text.trim()) {
+        heldWhitespace += text;
+        return;
+      }
+      const chunk = streamed ? text : (heldWhitespace + text).trimStart();
+      heldWhitespace = '';
+      streamed = true;
+      onEvent({ type: 'delta', text: chunk });
+    }
+    : undefined;
+
   for (let step = 0; step < MAX_TOOL_STEPS; step += 1) {
     const finalStep = step === MAX_TOOL_STEPS - 1;
     const assistant = await requestModelWithRetry({
@@ -537,22 +681,23 @@ export async function runHostTurn({
       messages,
       fetchImpl,
       timeoutMs: requestTimeoutMs,
-      ...(finalStep ? {
-        tools: [TOOL_DEFINITIONS.find((tool) => tool.function.name === 'finish_turn')],
-        toolChoice: { type: 'function', function: { name: 'finish_turn' } }
-      } : {})
+      onContent,
+      beforeAttempt: withdrawStreamed,
+      ...(finalStep ? { toolChoice: 'none' } : {})
     }, { attempts: requestAttempts, deadline, now, sleep });
     const calls = normalizedToolCalls(assistant.tool_calls, MAX_TOOL_CALLS - toolCallCount);
     messages.push(assistantMessageForHistory(assistant, calls));
     if (calls.length === 0) {
       const narration = typeof assistant.content === 'string' ? assistant.content.trim() : '';
       if (narration && narration.length <= 8_000) return plainNarration(narration);
+      withdrawStreamed();
       messages.push({
         role: 'system',
-        content: 'Finish now with concise player-facing narration. Use finish_turn or a plain response.'
+        content: 'Finish now: reply with concise player-facing narration as plain text, with no tool call.'
       });
       continue;
     }
+    withdrawStreamed();
 
     let finishedNarration = null;
     for (const call of calls) {

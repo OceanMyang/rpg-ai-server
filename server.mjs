@@ -92,6 +92,43 @@ function headers(contentType) {
   };
 }
 
+function publicError(error) {
+  const status = error.status || (error.code === 'NOT_FOUND' ? 404 : 500);
+  if (status >= 500) console.error(error);
+  return {
+    status,
+    error: status >= 500 && error.expose !== true && error.status === undefined
+      ? 'The RPG host could not complete that request.'
+      : error.message,
+    retryable: error.retryable === true
+  };
+}
+
+// Streams a turn as newline-delimited JSON: delta, reset, then done or error.
+async function streamTurn(response, setCookie, gameId, playerId, action, turnId) {
+  response.writeHead(200, {
+    ...headers('application/x-ndjson; charset=utf-8'),
+    'X-Accel-Buffering': 'no',
+    ...setCookie
+  });
+  response.flushHeaders?.();
+  const send = (event) => {
+    if (!response.writableEnded && !response.destroyed) response.write(`${JSON.stringify(event)}\n`);
+  };
+  // Keeps proxies from closing a connection that is quiet while the model thinks.
+  const heartbeat = setInterval(() => send({ type: 'ping' }), 15_000);
+  try {
+    const result = await playTurn(gameId, playerId, action, turnId, send);
+    send({ type: 'done', ...result });
+  } catch (error) {
+    const { status, error: message, retryable } = publicError(error);
+    send({ type: 'error', status, error: message, retryable });
+  } finally {
+    clearInterval(heartbeat);
+    response.end();
+  }
+}
+
 function sendJson(response, status, value, extraHeaders = {}) {
   response.writeHead(status, { ...headers('application/json; charset=utf-8'), ...extraHeaders });
   response.end(JSON.stringify(value));
@@ -120,7 +157,7 @@ function publicSession(session) {
   };
 }
 
-async function playTurn(gameId, playerId, action, turnId) {
+async function playTurn(gameId, playerId, action, turnId, onEvent) {
   return store.withGameLock(gameId, async () => {
     const session = await store.loadGame(gameId, playerId);
     const actionHash = createHash('sha256').update(action, 'utf8').digest('hex');
@@ -140,7 +177,8 @@ async function playTurn(gameId, playerId, action, turnId) {
         basePrompt,
         worldDir: stagingDir,
         publicHistory: history,
-        turnId
+        turnId,
+        onEvent
       });
       const result = { narration, status: 'playing' };
       session.messages = [...history, { role: 'assistant', content: narration }];
@@ -220,6 +258,10 @@ async function handleApi(request, response, url, playerId, setCookie) {
     if (typeof body.turnId !== 'string' || !TURN_ID_PATTERN.test(body.turnId)) {
       throw new HttpError(400, 'Turn id is invalid.');
     }
+    if ((request.headers.accept || '').includes('application/x-ndjson')) {
+      await streamTurn(response, setCookie, messageMatch[1], playerId, action, body.turnId);
+      return;
+    }
     const result = await playTurn(messageMatch[1], playerId, action, body.turnId);
     sendJson(response, 200, result, setCookie);
     return;
@@ -250,14 +292,12 @@ const server = createServer(async (request, response) => {
     });
     response.end(content);
   } catch (error) {
-    const status = error.status || (error.code === 'NOT_FOUND' ? 404 : 500);
-    if (status >= 500) console.error(error);
-    sendJson(response, status, {
-      error: status >= 500 && error.expose !== true && error.status === undefined
-        ? 'The RPG host could not complete that request.'
-        : error.message,
-      retryable: error.retryable === true
-    });
+    const { status, error: message, retryable } = publicError(error);
+    if (response.headersSent) {
+      response.end();
+      return;
+    }
+    sendJson(response, status, { error: message, retryable });
   }
 });
 

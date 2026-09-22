@@ -2,9 +2,9 @@ const STORAGE_KEY = 'rpg-ai.game-id.v1';
 const TOKEN_KEY = 'rpg-ai.access-token.v1';
 const PENDING_KEY = 'rpg-ai.pending-turn.v1';
 const TURN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
-const TURN_TIMEOUT_MS = 195_000;
-const ELAPSED_NOTICE_MS = 10_000;
-const SLOW_TURN_MS = 45_000;
+const TURN_TIMEOUT_MS = 60_000;
+const ELAPSED_NOTICE_MS = 1_000;
+const SLOW_TURN_MS = 30_000;
 const messagesElement = document.querySelector('#messages');
 const form = document.querySelector('#composer');
 const input = document.querySelector('#action');
@@ -99,7 +99,7 @@ function renderMarkdown(text) {
   return blocks.join('');
 }
 
-function appendMessage(role, content, extraClass = '') {
+function createMessage(role, content, extraClass = '') {
   const element = document.createElement('article');
   element.className = `message ${role} ${extraClass}`.trim();
   if (role === 'assistant' && extraClass !== 'waiting') {
@@ -108,29 +108,103 @@ function appendMessage(role, content, extraClass = '') {
   } else {
     element.textContent = content;
   }
+  return element;
+}
+
+function appendMessage(role, content, extraClass = '') {
+  const element = createMessage(role, content, extraClass);
   messagesElement.append(element);
   messagesElement.scrollTop = messagesElement.scrollHeight;
   return element;
 }
 
+// Turns the streamed bubble into the finished message where it stands,
+// so completing a turn never rebuilds the list or moves the scroll position.
+function finalizeWaiting(element, narration) {
+  element.className = 'message assistant markdown';
+  element.removeAttribute('role');
+  element.innerHTML = renderMarkdown(narration);
+  messagesElement.scrollTop = messagesElement.scrollHeight;
+}
+
+// Shown the instant a turn is sent, so there is never a silent gap.
+function appendWaiting() {
+  const element = document.createElement('article');
+  element.className = 'message assistant waiting';
+  element.setAttribute('role', 'status');
+  const label = document.createElement('span');
+  label.className = 'thinking';
+  label.textContent = 'The host is thinking';
+  const dots = document.createElement('span');
+  dots.className = 'dots';
+  dots.setAttribute('aria-hidden', 'true');
+  const elapsed = document.createElement('span');
+  elapsed.className = 'elapsed';
+  const pending = document.createElement('div');
+  pending.className = 'pending';
+  pending.append(label, dots, elapsed);
+  const stream = document.createElement('div');
+  stream.className = 'stream';
+  stream.hidden = true;
+  element.append(pending, stream);
+  messagesElement.append(element);
+  messagesElement.scrollTop = messagesElement.scrollHeight;
+  return element;
+}
+
+// Hides link markup, including a half-written [[link at the end of the stream.
+function streamingText(text) {
+  return text.replace(/\[\[([^\]\n]+)\]\]/gu, '$1').replace(/\[\[[^\]\n]*$/u, '');
+}
+
+function showStreaming(element, text) {
+  const pending = element.querySelector('.pending');
+  const stream = element.querySelector('.stream');
+  if (!pending || !stream) return;
+  pending.hidden = true;
+  stream.hidden = false;
+  element.classList.add('markdown', 'streaming');
+  stream.innerHTML = renderMarkdown(streamingText(text));
+  messagesElement.scrollTop = messagesElement.scrollHeight;
+}
+
+function showThinking(element) {
+  const pending = element.querySelector('.pending');
+  const stream = element.querySelector('.stream');
+  if (!pending || !stream) return;
+  stream.hidden = true;
+  stream.replaceChildren();
+  pending.hidden = false;
+  element.classList.remove('markdown', 'streaming');
+}
+
 function startWaitingTimer(element) {
   const startedAt = Date.now();
   const limit = Math.round(TURN_TIMEOUT_MS / 1000);
+  const label = element.querySelector('.thinking');
+  const elapsedElement = element.querySelector('.elapsed');
   const timer = setInterval(() => {
     const elapsed = Date.now() - startedAt;
     if (elapsed < ELAPSED_NOTICE_MS) return;
     const seconds = Math.round(elapsed / 1000);
-    element.textContent = elapsed >= SLOW_TURN_MS
-      ? `… the host is taking longer than usual (${seconds}s of ${limit}s)`
-      : `… (${seconds}s)`;
+    if (elapsed >= SLOW_TURN_MS && label) {
+      label.textContent = 'The host is taking longer than usual';
+      if (elapsedElement) elapsedElement.textContent = ` · ${seconds}s of ${limit}s`;
+    } else if (elapsedElement) {
+      elapsedElement.textContent = ` · ${seconds}s`;
+    }
     messagesElement.scrollTop = messagesElement.scrollHeight;
   }, 1_000);
   return () => clearInterval(timer);
 }
 
+// Builds the whole transcript at once and jumps straight to the end, rather
+// than animating down from the top.
 function renderMessages(messages) {
-  messagesElement.replaceChildren();
-  for (const message of messages) appendMessage(message.role, message.content);
+  const fragment = document.createDocumentFragment();
+  for (const message of messages) fragment.append(createMessage(message.role, message.content));
+  messagesElement.replaceChildren(fragment);
+  messagesElement.scrollTo({ top: messagesElement.scrollHeight, behavior: 'instant' });
 }
 
 function setBusy(value) {
@@ -190,7 +264,11 @@ function setGameStatus(status) {
 }
 
 async function api(path, options = {}) {
-  const { timeoutMs = 15_000, ...requestOptions } = options;
+  const {
+    timeoutMs = 15_000,
+    timeoutMessage = 'The server took too long to respond.',
+    ...requestOptions
+  } = options;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   let response;
@@ -208,7 +286,7 @@ async function api(path, options = {}) {
     clearTimeout(timeout);
     const error = new Error(
       cause?.name === 'AbortError'
-        ? 'The host took too long to answer and the turn timed out.'
+        ? timeoutMessage
         : 'The connection was interrupted.'
     );
     error.retryable = true;
@@ -290,12 +368,100 @@ function pendingTurn() {
   }
 }
 
-async function submitTurn(turn) {
-  const result = await api(`/api/games/${encodeURIComponent(turn.gameId)}/messages`, {
-    method: 'POST',
-    body: JSON.stringify({ action: turn.action, turnId: turn.turnId }),
-    timeoutMs: TURN_TIMEOUT_MS
-  });
+function turnError(message, { retryable = true, status } = {}) {
+  const error = new Error(message);
+  error.retryable = retryable;
+  error.status = status;
+  error.fromServer = true;
+  return error;
+}
+
+// Reads the turn as newline-delimited JSON events. The timeout is idle time:
+// every event, including the server's heartbeat, restarts it.
+async function submitTurn(turn, waiting) {
+  const controller = new AbortController();
+  let idleTimer;
+  const armIdleTimer = () => {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => controller.abort(), TURN_TIMEOUT_MS);
+  };
+  const interrupted = (cause) => turnError(cause?.name === 'AbortError'
+    ? 'The host took too long to answer and the turn timed out.'
+    : 'The connection was interrupted.');
+
+  armIdleTimer();
+  let response;
+  try {
+    response = await fetch(`/api/games/${encodeURIComponent(turn.gameId)}/messages`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/x-ndjson',
+        ...(accessToken ? { 'X-Access-Token': accessToken } : {})
+      },
+      body: JSON.stringify({ action: turn.action, turnId: turn.turnId }),
+      signal: controller.signal
+    });
+  } catch (cause) {
+    clearTimeout(idleTimer);
+    throw interrupted(cause);
+  }
+
+  if (!response.ok) {
+    clearTimeout(idleTimer);
+    let body = {};
+    try {
+      body = await response.json();
+    } catch { /* Keep the status-based message. */ }
+    if (response.status === 401) lockAccess();
+    throw turnError(body.error || `Request failed (${response.status}).`, {
+      retryable: body.retryable === true || response.status >= 500,
+      status: response.status
+    });
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let text = '';
+  let result = null;
+  const handleEvent = (event) => {
+    if (event.type === 'delta' && typeof event.text === 'string') {
+      text += event.text;
+      showStreaming(waiting, text);
+    } else if (event.type === 'reset') {
+      text = '';
+      showThinking(waiting);
+    } else if (event.type === 'done') {
+      result = event;
+    } else if (event.type === 'error') {
+      throw turnError(event.error || 'The turn could not be completed.', {
+        retryable: event.retryable === true,
+        status: event.status
+      });
+    }
+  };
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      armIdleTimer();
+      buffer += decoder.decode(value, { stream: true });
+      let newline;
+      while ((newline = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, newline).trim();
+        buffer = buffer.slice(newline + 1);
+        if (line) handleEvent(JSON.parse(line));
+      }
+    }
+  } catch (cause) {
+    if (cause?.fromServer) throw cause;
+    throw interrupted(cause);
+  } finally {
+    clearTimeout(idleTimer);
+  }
+
+  if (!result) throw turnError('The server returned an incomplete turn.');
   if (
     typeof result?.narration !== 'string'
     || result.narration.trim().length < 1
@@ -315,19 +481,12 @@ async function finishPendingTurn(turn, waiting) {
   const stopTimer = startWaitingTimer(waiting);
   statusElement.textContent = 'The host is thinking…';
   try {
-    const result = await submitTurn(turn);
+    const result = await submitTurn(turn, waiting);
     localStorage.removeItem(PENDING_KEY);
     awaitingRetry = false;
     stopTimer();
-    waiting.remove();
-    try {
-      const game = await api(`/api/games/${encodeURIComponent(turn.gameId)}`);
-      renderMessages(game.messages);
-      setGameStatus(game.status);
-    } catch {
-      appendMessage('assistant', result.narration);
-      setGameStatus(result.status);
-    }
+    finalizeWaiting(waiting, result.narration);
+    setGameStatus(result.status);
     return true;
   } catch (error) {
     stopTimer();
@@ -446,7 +605,7 @@ form.addEventListener('submit', async (event) => {
   if (awaitingRetry) {
     const turn = pendingTurn();
     if (!turn || turn.gameId !== gameId) return;
-    const waiting = appendMessage('assistant', '…', 'waiting');
+    const waiting = appendWaiting();
     setBusy(true);
     try {
       await finishPendingTurn(turn, waiting);
@@ -461,7 +620,7 @@ form.addEventListener('submit', async (event) => {
   input.value = '';
   resizeInput();
   appendMessage('user', action);
-  const waiting = appendMessage('assistant', '…', 'waiting');
+  const waiting = appendWaiting();
   const turn = { gameId, action, turnId: makeTurnId() };
   try {
     localStorage.setItem(PENDING_KEY, JSON.stringify(turn));

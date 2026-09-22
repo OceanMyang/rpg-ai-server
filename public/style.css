@@ -253,3 +253,62 @@ textarea.masked {
   -webkit-text-security: disc;
   text-security: disc;
 }
+
+.message.waiting .thinking {
+  color: #c9ceca;
+}
+
+.message.waiting .dots::after {
+  content: "";
+  display: inline-block;
+  width: 3ch;
+  white-space: nowrap;
+  overflow-wrap: normal;
+  text-align: left;
+  animation: thinking-dots 1.2s steps(4, end) infinite;
+}
+
+.message.waiting .elapsed {
+  color: #6e7471;
+}
+
+@keyframes thinking-dots {
+  0% { content: ""; }
+  25% { content: "."; }
+  50% { content: ".."; }
+  75% { content: "..."; }
+}
+
+.message.waiting::after {
+  content: "";
+  display: inline-block;
+  width: 0.55em;
+  height: 1em;
+  margin-left: 0.3em;
+  vertical-align: text-bottom;
+  background: #8e9491;
+  animation: thinking-cursor 1s steps(2, start) infinite;
+}
+
+@keyframes thinking-cursor {
+  to { visibility: hidden; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .message.waiting .dots::after {
+    animation: none;
+    content: "…";
+  }
+  .message.waiting::after {
+    animation: none;
+  }
+}
+
+.message.waiting .pending[hidden],
+.message.waiting .stream[hidden] {
+  display: none;
+}
+
+.message.streaming::after {
+  margin-left: 0;
+}

@@ -71,9 +71,19 @@ The server sends the model:
 - a manifest of the save's files,
 - `game/state.md`, plus the files linked from its Player Character section (the character sheet and current location).
 
-Every other file is loaded only when the model asks for it with `read_file`. The model resolves uncertain actions with `roll_dice`, records changes with `write_file`, and ends the turn with `finish_turn`. All tools are confined to that game's `files/` folder, and each turn's writes are staged and committed atomically.
+Every other file is loaded only when the model asks for it with `read_file`. The model resolves uncertain actions with `roll_dice` and records changes with `write_file`, then ends the turn by replying with the narration as plain text. All tools are confined to that game's `files/` folder, and each turn's writes are staged and committed atomically.
 
-Transient model failures are retried within a three-minute turn budget. An interrupted browser request keeps the same pending action and turn ID for the Retry button.
+The narration streams to the browser as the model writes it. The turn request (with `Accept: application/x-ndjson`) returns newline-delimited JSON events:
+
+- `delta`: the next piece of narration text;
+- `reset`: discard the text so far (the model was thinking aloud before a tool call, or a failed request is being retried);
+- `ping`: a heartbeat every 15 seconds, so proxies keep the connection open;
+- `done`: the final narration, once the turn has committed;
+- `error`: the turn failed and changed nothing.
+
+Streamed text is provisional: the world only changes when the turn commits. Clients that don't ask for NDJSON get a single JSON response instead.
+
+Transient model failures are retried within a one-minute turn budget (the server gives up at 55 seconds, the browser at 60). An interrupted browser request keeps the same pending action and turn ID for the Retry button.
 
 ## Configuration
 

@@ -249,11 +249,6 @@ textarea:disabled {
   border-top: 1px solid #2c2f2e;
 }
 
-textarea.masked {
-  -webkit-text-security: disc;
-  text-security: disc;
-}
-
 .message.waiting .thinking {
   color: #c9ceca;
 }

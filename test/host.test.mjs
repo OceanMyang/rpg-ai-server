@@ -15,7 +15,7 @@ function modelResponse(message) {
 
 test('host provides a manifest and executes an on-demand read/write loop', async (context) => {
   const world = await mkdtemp(path.join(os.tmpdir(), 'rpg-ai-host-'));
-  await mkdir(path.join(world, 'game'));
+  await mkdir(path.join(world, 'game'), { recursive: true });
   await mkdir(path.join(world, 'world', 'characters'), { recursive: true });
   await mkdir(path.join(world, 'world', 'player'));
 
@@ -144,7 +144,7 @@ test('host provides a manifest and executes an on-demand read/write loop', async
 
 test('host accepts non-empty direct narration as a completed turn', async (context) => {
   const world = await mkdtemp(path.join(os.tmpdir(), 'rpg-ai-finish-'));
-  await mkdir(path.join(world, 'game'));
+  await mkdir(path.join(world, 'game'), { recursive: true });
   await writeFile(path.join(world, 'game', 'state.md'), '# Game State\n');
   const originalFetch = globalThis.fetch;
   context.after(() => {
@@ -169,7 +169,7 @@ test('host accepts non-empty direct narration as a completed turn', async (conte
 
 test('host retries a transient provider failure without changing the transcript', async (context) => {
   const world = await mkdtemp(path.join(os.tmpdir(), 'rpg-ai-retry-'));
-  await mkdir(path.join(world, 'game'));
+  await mkdir(path.join(world, 'game'), { recursive: true });
   await writeFile(path.join(world, 'game', 'state.md'), '# Game State\n');
   const originalFetch = globalThis.fetch;
   context.after(() => {
@@ -202,7 +202,7 @@ test('host retries a transient provider failure without changing the transcript'
 
 test('host does not retry a rejected provider request', async (context) => {
   const world = await mkdtemp(path.join(os.tmpdir(), 'rpg-ai-rejected-'));
-  await mkdir(path.join(world, 'game'));
+  await mkdir(path.join(world, 'game'), { recursive: true });
   await writeFile(path.join(world, 'game', 'state.md'), '# Game State\n');
   const originalFetch = globalThis.fetch;
   context.after(() => {
@@ -233,7 +233,7 @@ test('host does not retry a rejected provider request', async (context) => {
 
 test('host bounds repeated transient provider failures', async () => {
   const world = await mkdtemp(path.join(os.tmpdir(), 'rpg-ai-outage-'));
-  await mkdir(path.join(world, 'game'));
+  await mkdir(path.join(world, 'game'), { recursive: true });
   await writeFile(path.join(world, 'game', 'state.md'), '# Game State\n');
   let calls = 0;
   let delays = 0;
@@ -261,9 +261,9 @@ test('host bounds repeated transient provider failures', async () => {
 
 test('host preserves a staged write while retrying the next model request', async () => {
   const world = await mkdtemp(path.join(os.tmpdir(), 'rpg-ai-write-retry-'));
+  await mkdir(path.join(world, 'game'), { recursive: true });
   const before = '# Player\n\nCarrying: rope\n';
   const after = '# Player\n\nCarrying: rope and a brass key\n';
-  await mkdir(path.join(world, 'game'));
   await writeFile(path.join(world, 'game', 'state.md'), '# Game State\n');
   await mkdir(path.join(world, 'world', 'player'), { recursive: true });
   await writeFile(path.join(world, 'world', 'player', 'Hero.md'), before);
@@ -326,7 +326,7 @@ test('host preserves a staged write while retrying the next model request', asyn
 
 test('dice results are stable when the same turn is retried', async () => {
   const world = await mkdtemp(path.join(os.tmpdir(), 'rpg-ai-dice-retry-'));
-  await mkdir(path.join(world, 'game'));
+  await mkdir(path.join(world, 'game'), { recursive: true });
   await writeFile(path.join(world, 'game', 'state.md'), '# Game State\n');
   const diceArgs = { count: 2, sides: 20, modifier: 1, reason: 'Cross the slick roof' };
 
@@ -384,7 +384,7 @@ const textChunk = (text) => ({ choices: [{ delta: { content: text } }] });
 
 test('streamed narration arrives as ordered deltas and becomes the turn result', async () => {
   const world = await mkdtemp(path.join(os.tmpdir(), 'rpg-ai-stream-'));
-  await mkdir(path.join(world, 'game'));
+  await mkdir(path.join(world, 'game'), { recursive: true });
   await writeFile(path.join(world, 'game', 'state.md'), '# Game State\n');
   const events = [];
   let requestBody;
@@ -417,7 +417,7 @@ test('streamed narration arrives as ordered deltas and becomes the turn result',
 
 test('preamble before a tool call is withdrawn and split tool arguments are assembled', async () => {
   const world = await mkdtemp(path.join(os.tmpdir(), 'rpg-ai-stream-tools-'));
-  await mkdir(path.join(world, 'game'));
+  await mkdir(path.join(world, 'game'), { recursive: true });
   await writeFile(path.join(world, 'game', 'state.md'), '# Game State\n');
   const events = [];
   const requests = [];
@@ -458,7 +458,7 @@ test('preamble before a tool call is withdrawn and split tool arguments are asse
 
 test('text streamed by a failed request is withdrawn before the retry', async () => {
   const world = await mkdtemp(path.join(os.tmpdir(), 'rpg-ai-stream-retry-'));
-  await mkdir(path.join(world, 'game'));
+  await mkdir(path.join(world, 'game'), { recursive: true });
   await writeFile(path.join(world, 'game', 'state.md'), '# Game State\n');
   const events = [];
   let calls = 0;
@@ -490,7 +490,7 @@ test('text streamed by a failed request is withdrawn before the retry', async ()
 
 test('whitespace before a tool call never reaches the player', async () => {
   const world = await mkdtemp(path.join(os.tmpdir(), 'rpg-ai-stream-ws-'));
-  await mkdir(path.join(world, 'game'));
+  await mkdir(path.join(world, 'game'), { recursive: true });
   await writeFile(path.join(world, 'game', 'state.md'), '# Game State\n');
   const events = [];
   let calls = 0;
@@ -522,7 +522,7 @@ test('whitespace before a tool call never reaches the player', async () => {
 
 test('streamed reasoning fragments are merged into whole blocks for the history', async () => {
   const world = await mkdtemp(path.join(os.tmpdir(), 'rpg-ai-stream-reasoning-'));
-  await mkdir(path.join(world, 'game'));
+  await mkdir(path.join(world, 'game'), { recursive: true });
   await writeFile(path.join(world, 'game', 'state.md'), '# Game State\n');
   const requests = [];
   const fragment = (text) => ({

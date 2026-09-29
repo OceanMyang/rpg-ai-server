@@ -1,5 +1,6 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import {
+  copyFile,
   mkdir,
   readdir,
   readFile,
@@ -11,11 +12,75 @@ import path from 'node:path';
 import { copyWorld, listWorldFiles, readWorldFile } from './world-files.mjs';
 
 const GAME_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
-const SAVE_FORMAT = 3;
+const SAVE_FORMAT = 6;
+const WORLD_SLUG_PATTERN = /^[a-z0-9][a-z0-9-]{0,39}$/u;
 const PLAYER_ID_PATTERN = /^[0-9a-f]{32}$/u;
-const TEMPLATE_FOLDERS = ['game', 'world'];
+// A world package: these files and the world/ folder are copied into each save.
+// rules.md sits outside them: it is prompt material, not world state, so it is
+// never copied into a save and the host cannot read or rewrite it mid-game.
+const TEMPLATE_FILES = ['game/state.md', 'game/log.md'];
+const TEMPLATE_FOLDER = 'world';
 const PLAYER_FOLDER = 'world/player/';
 const locks = new Map();
+
+// A world is a self-contained folder: world.json plus the game/ and world/
+// templates that get copied into each new save.
+export async function listWorlds(worldsRoot) {
+  let entries;
+  try {
+    entries = await readdir(worldsRoot, { withFileTypes: true });
+  } catch (error) {
+    if (error.code === 'ENOENT') return [];
+    throw error;
+  }
+
+  const worlds = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !WORLD_SLUG_PATTERN.test(entry.name)) continue;
+    const directory = path.join(worldsRoot, entry.name);
+    try {
+      await readFile(path.join(directory, 'game', 'state.md'));
+    } catch {
+      continue; // Not a playable world; skip it rather than offering a broken game.
+    }
+    let meta = {};
+    try {
+      meta = JSON.parse(await readFile(path.join(directory, 'world.json'), 'utf8'));
+    } catch { /* world.json is optional. */ }
+    worlds.push({
+      slug: entry.name,
+      title: typeof meta.title === 'string' && meta.title.trim() ? meta.title.trim() : entry.name,
+      blurb: typeof meta.blurb === 'string' ? meta.blurb.trim() : ''
+    });
+  }
+  worlds.sort((a, b) => a.title.localeCompare(b.title));
+  return worlds;
+}
+
+// A world may ship rules of its own, appended to the shared ones at turn time.
+// A world's own rules live beside the world, never in a save: they are appended to the
+// system prompt for that game's turns, so editing them reaches games already in progress.
+// A world may script the first message the player reads. It is shown before any model
+// request, so there is always something to answer even if the provider is down.
+export async function readWorldOpening(worldsRoot, slug) {
+  if (!WORLD_SLUG_PATTERN.test(slug ?? '')) return '';
+  try {
+    return (await readFile(path.join(worldsRoot, slug, 'opening.md'), 'utf8')).trim();
+  } catch (error) {
+    if (error.code === 'ENOENT') return '';
+    throw error;
+  }
+}
+
+export async function readWorldRules(worldsRoot, slug) {
+  if (!WORLD_SLUG_PATTERN.test(slug ?? '')) return '';
+  try {
+    return (await readFile(path.join(worldsRoot, slug, 'rules.md'), 'utf8')).trim();
+  } catch (error) {
+    if (error.code === 'ENOENT') return '';
+    throw error;
+  }
+}
 
 export function newPlayerId() {
   return randomBytes(16).toString('hex');
@@ -61,17 +126,25 @@ export async function openingMessage(filesDir) {
   if (players.length === 0) {
     return 'A new story begins.\n\nSend any message to begin, and a character will be chosen for you at random.';
   }
-  const choices = [];
-  for (const [index, file] of players.entries()) {
+  const described = [];
+  for (const file of players) {
     const name = file.path.slice(PLAYER_FOLDER.length, -'.md'.length);
     const { content } = await readWorldFile(filesDir, file.path);
     const concept = /^\s*-\s*\*\*Concept:\*\*\s*(.+?)\s*$/imu.exec(content)?.[1];
-    choices.push(`${index + 1}. ${name}${concept ? ` — ${concept}` : ''}`);
+    described.push({ name, concept });
   }
+  // A world with a single character has nothing to choose.
+  if (described.length === 1) {
+    const { name, concept } = described[0];
+    return `A new story begins. You play ${name}${concept ? ` — ${concept}` : ''}.\n\nSend any message to begin.`;
+  }
+  const choices = described.map(({ name, concept }, index) => (
+    `${index + 1}. ${name}${concept ? ` — ${concept}` : ''}`
+  ));
   return `A new story begins. Choose your character:\n\n${choices.join('\n')}\n\nReply with a name or number to begin.`;
 }
 
-export function createGameStore({ saveRoot, templateRoot }) {
+export function createGameStore({ saveRoot, worldsRoot }) {
   // Each player keeps their own pointer, so no visitor can land in another's story.
   const playerDir = path.join(saveRoot, 'players');
   const activeFileFor = (playerId) => {
@@ -161,21 +234,38 @@ export function createGameStore({ saveRoot, templateRoot }) {
     });
   }
 
-  async function createGame(playerId) {
+  async function createGame(playerId, worldSlug) {
     assertPlayerId(playerId);
+    const worlds = await listWorlds(worldsRoot);
+    const world = worlds.find((candidate) => candidate.slug === worldSlug)
+      ?? (worlds.length === 1 && !worldSlug ? worlds[0] : null);
+    if (!world) {
+      const error = new Error(
+        worlds.length === 0 ? 'No worlds are installed.' : 'That world does not exist.'
+      );
+      error.code = 'NO_WORLD';
+      error.status = 400;
+      throw error;
+    }
     await mkdir(saveRoot, { recursive: true, mode: 0o700 });
     const id = randomUUID();
     const { gameDir, filesDir, sessionFile } = pathsFor(id);
     await mkdir(gameDir, { mode: 0o700 });
     await mkdir(filesDir, { mode: 0o700 });
-    for (const folder of TEMPLATE_FOLDERS) {
-      await copyWorld(path.join(templateRoot, folder), path.join(filesDir, folder));
+    const source = path.join(worldsRoot, world.slug);
+    await copyWorld(path.join(source, TEMPLATE_FOLDER), path.join(filesDir, TEMPLATE_FOLDER));
+    await mkdir(path.join(filesDir, 'game'), { mode: 0o700 });
+    for (const name of TEMPLATE_FILES) {
+      await copyFile(path.join(source, name), path.join(filesDir, name));
     }
-    const opening = await openingMessage(filesDir);
+    const opening = (await readWorldOpening(worldsRoot, world.slug))
+      || await openingMessage(filesDir);
     const now = new Date().toISOString();
     const session = {
       id,
       playerId,
+      world: world.slug,
+      worldTitle: world.title,
       format: SAVE_FORMAT,
       status: 'playing',
       createdAt: now,
@@ -322,6 +412,9 @@ export function createGameStore({ saveRoot, templateRoot }) {
   }
 
   return {
+    listWorlds: () => listWorlds(worldsRoot),
+    worldRules: (slug) => readWorldRules(worldsRoot, slug),
+    worldOpening: (slug) => readWorldOpening(worldsRoot, slug),
     createGame,
     loadGame,
     loadCurrentGame,

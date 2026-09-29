@@ -1,5 +1,5 @@
 import { createServer } from 'node:http';
-import { createHash, timingSafeEqual } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -12,12 +12,8 @@ await loadEnv(path.join(ROOT, '.env'));
 
 const HOST = process.env.HOST || '0.0.0.0';
 const PORT = Number.parseInt(process.env.PORT || '3000', 10);
-const MODEL = process.env.RPG_MODEL || 'inclusionai/ling-3.0-flash-vl:free';
+const MODEL = process.env.RPG_MODEL;
 const API_KEY = process.env.OPENROUTER_API_KEY || process.env.API_KEY || '';
-const ACCESS_PASSWORD = process.env.ACCESS_PASSWORD || '';
-const ACCESS_TOKEN = ACCESS_PASSWORD
-  ? createHash('sha256').update(`rpg-ai:${ACCESS_PASSWORD}`).digest('hex')
-  : '';
 const MAX_BODY_BYTES = 16 * 1024;
 const PLAYER_COOKIE = 'rpg_player';
 const PLAYER_COOKIE_MAX_AGE = 60 * 60 * 24 * 365;
@@ -27,21 +23,10 @@ if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65_535) {
   throw new Error('PORT must be an integer between 1 and 65535.');
 }
 
-// Refuse to expose an unprotected game to the network.
-const LOOPBACK = new Set(['127.0.0.1', 'localhost', '::1']);
-if (!LOOPBACK.has(HOST) && !ACCESS_PASSWORD) {
-  throw new Error(
-    `Refusing to listen on ${HOST} without a password. Set ACCESS_PASSWORD in .env, or bind to 127.0.0.1.`
-  );
-}
-
-const basePrompt = [
-  await readFile(path.join(ROOT, 'system_prompt.md'), 'utf8'),
-  await readFile(path.join(ROOT, 'host_rules.md'), 'utf8')
-].map((part) => part.trim()).join('\n\n---\n\n');
+const basePrompt = (await readFile(path.join(ROOT, 'system_prompt.md'), 'utf8')).trim();
 const store = createGameStore({
   saveRoot: process.env.SAVE_DIR || path.join(ROOT, 'saves'),
-  templateRoot: ROOT
+  worldsRoot: path.join(ROOT, 'worlds')
 });
 
 const staticFiles = new Map([
@@ -50,11 +35,6 @@ const staticFiles = new Map([
   ['/app.js', ['app.js', 'text/javascript; charset=utf-8']],
   ['/style.css', ['style.css', 'text/css; charset=utf-8']]
 ]);
-
-function tokenMatches(candidate) {
-  if (typeof candidate !== 'string' || candidate.length !== ACCESS_TOKEN.length) return false;
-  return timingSafeEqual(Buffer.from(candidate, 'utf8'), Buffer.from(ACCESS_TOKEN, 'utf8'));
-}
 
 class HttpError extends Error {
   constructor(status, message) {
@@ -153,6 +133,8 @@ function publicSession(session) {
   return {
     id: session.id,
     status: session.status,
+    world: session.world,
+    worldTitle: session.worldTitle,
     messages: session.messages
   };
 }
@@ -171,10 +153,11 @@ async function playTurn(gameId, playerId, action, turnId, onEvent) {
     const stagingDir = await store.beginTurn(gameId);
     try {
       const history = [...session.messages, { role: 'user', content: action }];
+      const worldRules = await store.worldRules(session.world);
       const narration = await runHostTurn({
         apiKey: API_KEY,
         model: MODEL,
-        basePrompt,
+        basePrompt: worldRules ? `${basePrompt}\n\n---\n\n${worldRules}` : basePrompt,
         worldDir: stagingDir,
         publicHistory: history,
         turnId,
@@ -201,32 +184,17 @@ async function playTurn(gameId, playerId, action, turnId, onEvent) {
 
 async function handleApi(request, response, url, playerId, setCookie) {
   if (request.method === 'GET' && url.pathname === '/api/status') {
-    sendJson(response, 200, {
-      configured: Boolean(API_KEY),
-      model: MODEL,
-      requiresPassword: Boolean(ACCESS_TOKEN)
-    }, setCookie);
+    sendJson(response, 200, { configured: Boolean(API_KEY), model: MODEL }, setCookie);
     return;
   }
-  if (ACCESS_TOKEN) {
-    if (request.method === 'POST' && url.pathname === '/api/session') {
-      const body = await readJson(request);
-      const password = typeof body.password === 'string' ? body.password : '';
-      const candidate = createHash('sha256').update(`rpg-ai:${password}`).digest('hex');
-      // A wrong password costs a second, which makes guessing over the network impractical.
-      if (!tokenMatches(candidate)) {
-        await new Promise((resolve) => setTimeout(resolve, 1_000));
-        throw new HttpError(401, 'Wrong password.');
-      }
-      sendJson(response, 200, { token: ACCESS_TOKEN }, setCookie);
-      return;
-    }
-    if (!tokenMatches(request.headers['x-access-token'])) {
-      throw new HttpError(401, 'This game is password-protected.');
-    }
+  if (request.method === 'GET' && url.pathname === '/api/worlds') {
+    sendJson(response, 200, { worlds: await store.listWorlds() }, setCookie);
+    return;
   }
   if (request.method === 'POST' && url.pathname === '/api/games') {
-    const session = await store.createGame(playerId);
+    const body = await readJson(request);
+    const world = typeof body.world === 'string' ? body.world : undefined;
+    const session = await store.createGame(playerId, world);
     sendJson(response, 201, publicSession(session), setCookie);
     return;
   }
@@ -304,5 +272,4 @@ const server = createServer(async (request, response) => {
 server.listen(PORT, HOST, () => {
   console.log(`RPG AI is running at http://${HOST}:${PORT}`);
   console.log(API_KEY ? `Model: ${MODEL}` : 'Model unavailable: add API_KEY to .env');
-  console.log(ACCESS_TOKEN ? 'Access: password required' : 'Access: open (set ACCESS_PASSWORD to require one)');
 });

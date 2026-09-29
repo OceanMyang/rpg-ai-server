@@ -1,5 +1,4 @@
 const STORAGE_KEY = 'rpg-ai.game-id.v1';
-const TOKEN_KEY = 'rpg-ai.access-token.v1';
 const PENDING_KEY = 'rpg-ai.pending-turn.v1';
 const TURN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const TURN_TIMEOUT_MS = 60_000;
@@ -18,8 +17,8 @@ let gameStatus = 'playing';
 let awaitingRetry = false;
 let hostConfigured = true;
 let retryNotice = null;
-let accessToken = localStorage.getItem(TOKEN_KEY) || '';
-let locked = false;
+let worldChoices = null;
+let worldTitle = '';
 
 function escapeHtml(text) {
   return text.replace(/[&<>"']/gu, (character) => ({
@@ -209,48 +208,12 @@ function renderMessages(messages) {
 
 function setBusy(value) {
   busy = value;
-  input.disabled = value || (!locked && (awaitingRetry || gameStatus === 'won'));
-  sendButton.disabled = value || (!locked && (gameStatus === 'won' || (awaitingRetry && !pendingTurn())));
+  input.disabled = value || (!worldChoices && (awaitingRetry || gameStatus === 'won'));
+  sendButton.disabled = value
+    || (!worldChoices && (gameStatus === 'won' || (awaitingRetry && !pendingTurn())));
   sendButton.textContent = awaitingRetry ? 'Retry' : 'Send';
   newGameButton.disabled = value;
   if (!input.disabled) input.focus();
-}
-
-function lockAccess() {
-  locked = true;
-  accessToken = '';
-  localStorage.removeItem(TOKEN_KEY);
-  input.value = '';
-  input.classList.add('masked');
-  input.placeholder = 'Access password';
-  statusElement.textContent = 'Password required';
-}
-
-function unlockAccess(token) {
-  locked = false;
-  accessToken = token;
-  localStorage.setItem(TOKEN_KEY, token);
-  input.classList.remove('masked');
-  input.placeholder = 'What do you do?';
-}
-
-async function submitPassword(password) {
-  setBusy(true);
-  statusElement.textContent = 'Checking…';
-  try {
-    const { token } = await api('/api/session', {
-      method: 'POST',
-      body: JSON.stringify({ password })
-    });
-    unlockAccess(token);
-    messagesElement.replaceChildren();
-    await restoreGame();
-  } catch (error) {
-    appendMessage('notice', error.message);
-    statusElement.textContent = 'Password required';
-  } finally {
-    setBusy(false);
-  }
 }
 
 function setGameStatus(status) {
@@ -258,7 +221,7 @@ function setGameStatus(status) {
   statusElement.textContent = status === 'won'
     ? 'The beacon burns · victory'
     : hostConfigured
-      ? 'Merrowdale'
+      ? (worldTitle || 'Choose a world')
       : 'Host needs an API key';
   setBusy(busy);
 }
@@ -278,7 +241,6 @@ async function api(path, options = {}) {
       signal: controller.signal,
       headers: {
         'Content-Type': 'application/json',
-        ...(accessToken ? { 'X-Access-Token': accessToken } : {}),
         ...(requestOptions.headers || {})
       }
     });
@@ -397,7 +359,6 @@ async function submitTurn(turn, waiting) {
       headers: {
         'Content-Type': 'application/json',
         Accept: 'application/x-ndjson',
-        ...(accessToken ? { 'X-Access-Token': accessToken } : {})
       },
       body: JSON.stringify({ action: turn.action, turnId: turn.turnId }),
       signal: controller.signal
@@ -507,15 +468,74 @@ async function finishPendingTurn(turn, waiting) {
   }
 }
 
-async function createGame() {
+// With more than one world installed, the player picks one the same way they
+// pick a character: a numbered list answered in the composer.
+async function offerWorlds() {
+  setBusy(true);
+  try {
+    const { worlds } = await api('/api/worlds');
+    if (!Array.isArray(worlds) || worlds.length === 0) {
+      appendMessage('notice', 'No worlds are installed on this server.');
+      statusElement.textContent = 'Unavailable';
+      return;
+    }
+    if (worlds.length === 1) {
+      await createGame(worlds[0].slug);
+      return;
+    }
+    worldChoices = worlds;
+    const lines = worlds.map((world, index) => (
+      `${index + 1}. ${world.title}${world.blurb ? ` — ${world.blurb}` : ''}`
+    ));
+    appendMessage('assistant', `Choose a world:\n\n${lines.join('\n')}\n\nReply with a name or number.`);
+    statusElement.textContent = 'Choose a world';
+    input.placeholder = 'Name or number';
+  } catch (error) {
+    appendMessage('notice', error.message);
+    statusElement.textContent = 'Unavailable';
+  } finally {
+    setBusy(false);
+  }
+}
+
+function pickWorld(answer) {
+  const text = answer.trim().toLowerCase();
+  const byNumber = Number.parseInt(text, 10);
+  if (Number.isInteger(byNumber) && byNumber >= 1 && byNumber <= worldChoices.length) {
+    return worldChoices[byNumber - 1];
+  }
+  return worldChoices.find((world) => (
+    world.slug === text
+    || world.title.toLowerCase() === text
+    || world.title.toLowerCase().startsWith(text)
+  ));
+}
+
+async function chooseWorld(answer) {
+  const world = pickWorld(answer);
+  if (!world) {
+    appendMessage('notice', 'Pick one of the worlds listed above, by name or number.');
+    return;
+  }
+  worldChoices = null;
+  input.placeholder = 'What do you do?';
+  messagesElement.replaceChildren();
+  await createGame(world.slug);
+}
+
+async function createGame(world) {
   setBusy(true);
   statusElement.textContent = 'Preparing a new world…';
   try {
-    const game = await api('/api/games', { method: 'POST', body: '{}' });
+    const game = await api('/api/games', {
+      method: 'POST',
+      body: JSON.stringify(world ? { world } : {})
+    });
     gameId = game.id;
     localStorage.setItem(STORAGE_KEY, gameId);
     localStorage.removeItem(PENDING_KEY);
     awaitingRetry = false;
+    worldTitle = game.worldTitle || '';
     renderMessages(game.messages);
     setGameStatus(game.status);
   } catch (error) {
@@ -531,12 +551,6 @@ async function restoreGame() {
   try {
     const server = await api('/api/status');
     hostConfigured = server.configured;
-    if (server.requiresPassword && !accessToken) {
-      lockAccess();
-      appendMessage('notice', 'This game is password-protected. Enter the password to continue.');
-      setBusy(false);
-      return;
-    }
     let game;
     if (gameId) {
       try {
@@ -555,10 +569,11 @@ async function restoreGame() {
       } catch (error) {
         if (error.status !== 404) throw error;
         localStorage.removeItem(PENDING_KEY);
-        await createGame();
+        await offerWorlds();
         return;
       }
     }
+    worldTitle = game.worldTitle || '';
     renderMessages(game.messages);
     setGameStatus(game.status);
 
@@ -593,12 +608,13 @@ function resizeInput() {
 form.addEventListener('submit', async (event) => {
   event.preventDefault();
   if (busy) return;
-  if (locked) {
-    const password = input.value;
-    if (!password) return;
+  if (worldChoices) {
+    const answer = input.value.trim();
+    if (!answer) return;
     input.value = '';
     resizeInput();
-    await submitPassword(password);
+    appendMessage('user', answer);
+    await chooseWorld(answer);
     return;
   }
   if (!gameId) return;
@@ -651,8 +667,10 @@ newGameButton.addEventListener('click', () => {
   gameId = null;
   awaitingRetry = false;
   gameStatus = 'playing';
+  worldChoices = null;
+  worldTitle = '';
   messagesElement.replaceChildren();
-  createGame();
+  offerWorlds();
 });
 
 restoreGame();
